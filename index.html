@@ -1,0 +1,1130 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>冰与火之人</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #0a0a0a;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 100vh;
+  overflow: hidden;
+  font-family: 'Segoe UI', sans-serif;
+}
+canvas { display: block; image-rendering: pixelated; max-width: 100vw; max-height: 100vh; object-fit: contain; }
+#ui-overlay {
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+#top-bar {
+  color: #ddd;
+  font-size: 20px;
+  padding: 10px;
+  text-shadow: 0 0 8px rgba(255,150,0,0.5);
+  letter-spacing: 2px;
+}
+#bottom-bar {
+  position: absolute;
+  bottom: 8px;
+  color: #888;
+  font-size: 13px;
+  letter-spacing: 1px;
+}
+#message-overlay {
+  position: absolute;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  color: #fff;
+  font-size: 36px;
+  text-align: center;
+  text-shadow: 0 0 20px rgba(255,200,0,0.8);
+  display: none;
+  line-height: 1.6;
+}
+#message-overlay .sub {
+  font-size: 18px;
+  color: #aaa;
+  margin-top: 8px;
+}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="ui-overlay">
+  <div id="top-bar">第 1 关</div>
+  <div id="message-overlay"></div>
+  <div id="bottom-bar">🔥 火人：方向键 ←↑→ ｜ 🧊 冰人：W A D ｜ R 重试</div>
+</div>
+<script>
+// ============================================================
+//  冰与火之人 - Ice & Fire
+// ============================================================
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const topBar = document.getElementById('top-bar');
+const msgOverlay = document.getElementById('message-overlay');
+
+// --- Constants ---
+const TILE = 32;
+const COLS = 40;
+const ROWS = 25;
+const W = COLS * TILE;  // 1280
+const H = ROWS * TILE;  // 800
+canvas.width = W;
+canvas.height = H;
+
+const GRAVITY = 0.55;
+const MAX_FALL = 12;
+const MOVE_SPEED = 2.2;
+const JUMP_VEL = -11;
+const DOUBLE_JUMP_VEL = -9.5;
+const COYOTE_TIME = 6;    // frames
+const JUMP_BUFFER = 8;    // frames
+const FRICTION = 0.82;
+
+// Tile types
+const T = {
+  AIR: 0,
+  WALL: 1,
+  LAVA: 2,      // kills ice, safe for fire
+  WATER: 3,     // kills fire, safe for ice
+  POISON: 4,    // kills both
+  FIRE_DOOR: 5,
+  ICE_DOOR: 6,
+  BUTTON_A: 7,  // button that controls gate A
+  GATE_A: 8,    // gate opened by button A
+  BUTTON_B: 9,
+  GATE_B: 10,
+  MOVING_H: 11, // horizontal moving platform (marker, replaced at runtime)
+  MOVING_V: 12, // vertical moving platform
+  BUTTON_C: 13,
+  GATE_C: 14,
+};
+
+// --- Input ---
+const keys = {};
+window.addEventListener('keydown', e => { keys[e.code] = true; e.preventDefault(); });
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// ============================================================
+//  LEVEL DEFINITIONS (2D tile arrays)
+// ============================================================
+// Legend: see T above. Arrays are ROWS x COLS.
+
+function emptyMap() {
+  const m = [];
+  for (let r = 0; r < ROWS; r++) { m.push(new Array(COLS).fill(0)); }
+  return m;
+}
+
+function bordered(m) {
+  for (let c = 0; c < COLS; c++) { m[0][c] = 1; m[ROWS-1][c] = 1; }
+  for (let r = 0; r < ROWS; r++) { m[r][0] = 1; m[r][COLS-1] = 1; }
+  return m;
+}
+
+function fillRect(m, r1, c1, r2, c2, v) {
+  for (let r = r1; r <= r2; r++)
+    for (let c = c1; c <= c2; c++)
+      m[r][c] = v;
+}
+
+function buildLevel1() {
+  const m = bordered(emptyMap());
+  // Ground
+  fillRect(m, 22, 1, 22, 38, 1);
+
+  // Lava pool (left-center)
+  fillRect(m, 22, 10, 22, 14, 0);
+  fillRect(m, 23, 10, 23, 14, T.LAVA);
+
+  // Water pool (right-center)
+  fillRect(m, 22, 24, 22, 28, 0);
+  fillRect(m, 23, 24, 23, 28, T.WATER);
+
+  // Platforms
+  fillRect(m, 18, 5, 18, 10, 1);
+  fillRect(m, 14, 14, 14, 20, 1);
+  fillRect(m, 18, 24, 18, 30, 1);
+  fillRect(m, 10, 8, 10, 14, 1);
+  fillRect(m, 10, 25, 10, 32, 1);
+
+  // Upper platforms near doors
+  fillRect(m, 6, 3, 6, 8, 1);
+  fillRect(m, 6, 31, 6, 37, 1);
+
+  // Small stepping stones
+  fillRect(m, 15, 8, 15, 9, 1);
+  fillRect(m, 15, 30, 15, 31, 1);
+
+  // Doors
+  m[5][5] = T.FIRE_DOOR;
+  m[5][35] = T.ICE_DOOR;
+
+  return {
+    map: m,
+    fireStart: { x: 3 * TILE, y: 21 * TILE },
+    iceStart: { x: 36 * TILE, y: 21 * TILE },
+    movingPlatforms: [],
+    buttons: [],
+    gates: [],
+  };
+}
+
+function buildLevel2() {
+  const m = bordered(emptyMap());
+
+  // Ground level
+  fillRect(m, 23, 1, 23, 38, 1);
+
+  // Lava pool left
+  fillRect(m, 23, 5, 23, 8, 0);
+  fillRect(m, 24, 5, 24, 8, T.LAVA);
+
+  // Water pool right
+  fillRect(m, 23, 31, 23, 34, 0);
+  fillRect(m, 24, 31, 24, 34, T.WATER);
+
+  // --- Multi-layer platforms ---
+  // Layer 1
+  fillRect(m, 20, 2, 20, 8, 1);
+  fillRect(m, 20, 14, 20, 22, 1);
+  fillRect(m, 20, 30, 20, 38, 1);
+
+  // Layer 2
+  fillRect(m, 16, 5, 16, 12, 1);
+  fillRect(m, 16, 26, 16, 35, 1);
+
+  // Layer 3
+  fillRect(m, 12, 1, 12, 8, 1);
+  fillRect(m, 12, 18, 12, 24, 1);
+  fillRect(m, 12, 32, 12, 38, 1);
+
+  // Layer 4
+  fillRect(m, 8, 10, 8, 18, 1);
+  fillRect(m, 8, 28, 8, 34, 1);
+
+  // Top platforms for doors
+  fillRect(m, 4, 2, 4, 7, 1);
+  fillRect(m, 4, 33, 4, 38, 1);
+
+  // Walls / barriers
+  fillRect(m, 13, 15, 16, 15, 1);
+  fillRect(m, 9, 24, 12, 24, 1);
+
+  // Gate A (blocks path to ice door side)
+  m[4][32] = T.GATE_A;
+  m[3][32] = T.GATE_A;
+
+  // Button A on left side (fire stands on it to open gate for ice)
+  m[11][4] = T.BUTTON_A;
+
+  // Gate B (blocks path to fire door side)
+  m[4][8] = T.GATE_B;
+  m[3][8] = T.GATE_B;
+
+  // Button B on right side
+  m[11][35] = T.BUTTON_B;
+
+  // Doors
+  m[3][4] = T.FIRE_DOOR;
+  m[3][36] = T.ICE_DOOR;
+
+  // Moving platforms
+  const movingPlatforms = [
+    { x: 10 * TILE, y: 18 * TILE, w: 4 * TILE, h: TILE * 0.5, axis: 'x', min: 10 * TILE, max: 16 * TILE, speed: 1.2, dir: 1 },
+    { x: 24 * TILE, y: 14 * TILE, w: 4 * TILE, h: TILE * 0.5, axis: 'y', min: 10 * TILE, max: 18 * TILE, speed: 1, dir: 1 },
+    { x: 20 * TILE, y: 6 * TILE, w: 4 * TILE, h: TILE * 0.5, axis: 'x', min: 16 * TILE, max: 28 * TILE, speed: 1.5, dir: 1 },
+  ];
+
+  return {
+    map: m,
+    fireStart: { x: 3 * TILE, y: 22 * TILE },
+    iceStart: { x: 36 * TILE, y: 22 * TILE },
+    movingPlatforms,
+    buttons: [
+      { type: 'A', col: 4, row: 11 },
+      { type: 'B', col: 35, row: 11 },
+    ],
+    gates: [
+      { type: 'A', tiles: [[4,32],[3,32]] },
+      { type: 'B', tiles: [[4,8],[3,8]] },
+    ],
+  };
+}
+
+function buildLevel3() {
+  const m = bordered(emptyMap());
+
+  // Ground with gaps
+  fillRect(m, 23, 1, 23, 12, 1);
+  fillRect(m, 23, 16, 23, 24, 1);
+  fillRect(m, 23, 28, 23, 38, 1);
+
+  // Poison pits in gaps
+  fillRect(m, 24, 13, 24, 15, T.POISON);
+  fillRect(m, 24, 25, 24, 27, T.POISON);
+
+  // Lava pool
+  fillRect(m, 23, 3, 23, 5, 0);
+  fillRect(m, 24, 3, 24, 5, T.LAVA);
+
+  // Water pool
+  fillRect(m, 23, 33, 23, 35, 0);
+  fillRect(m, 24, 33, 24, 35, T.WATER);
+
+  // --- Complex multi-layer ---
+  // Layer 1
+  fillRect(m, 20, 2, 20, 6, 1);
+  fillRect(m, 20, 10, 20, 16, 1);
+  fillRect(m, 20, 20, 20, 26, 1);
+  fillRect(m, 20, 32, 20, 38, 1);
+
+  // Layer 2
+  fillRect(m, 17, 5, 17, 10, 1);
+  fillRect(m, 17, 16, 17, 22, 1);
+  fillRect(m, 17, 28, 17, 36, 1);
+
+  // Layer 3
+  fillRect(m, 14, 1, 14, 6, 1);
+  fillRect(m, 14, 12, 14, 18, 1);
+  fillRect(m, 14, 24, 14, 30, 1);
+  fillRect(m, 14, 34, 14, 38, 1);
+
+  // Layer 4
+  fillRect(m, 11, 6, 11, 14, 1);
+  fillRect(m, 11, 20, 11, 28, 1);
+  fillRect(m, 11, 32, 11, 38, 1);
+
+  // Layer 5
+  fillRect(m, 8, 1, 8, 8, 1);
+  fillRect(m, 8, 14, 8, 22, 1);
+  fillRect(m, 8, 28, 8, 34, 1);
+
+  // Top platforms
+  fillRect(m, 5, 2, 5, 8, 1);
+  fillRect(m, 5, 16, 5, 24, 1);
+  fillRect(m, 5, 30, 5, 38, 1);
+
+  // Poison pools on platforms
+  fillRect(m, 17, 12, 17, 14, 0);
+  fillRect(m, 18, 12, 18, 14, T.POISON);
+
+  fillRect(m, 14, 8, 14, 10, 0);
+  fillRect(m, 15, 8, 15, 10, T.POISON);
+
+  fillRect(m, 11, 16, 11, 18, 0);
+  fillRect(m, 12, 16, 12, 18, T.POISON);
+
+  // Walls
+  fillRect(m, 6, 14, 8, 14, 1);
+  fillRect(m, 9, 28, 11, 28, 1);
+  fillRect(m, 6, 28, 8, 28, 1);
+
+  // Gate A
+  m[5][10] = T.GATE_A;
+  m[4][10] = T.GATE_A;
+
+  // Gate B
+  m[5][29] = T.GATE_B;
+  m[4][29] = T.GATE_B;
+
+  // Gate C (mid level)
+  m[14][22] = T.GATE_C;
+  m[13][22] = T.GATE_C;
+
+  // Button A (ice side, needs ice to press)
+  m[7][32] = T.BUTTON_A;
+
+  // Button B (fire side)
+  m[7][4] = T.BUTTON_B;
+
+  // Button C (mid)
+  m[13][15] = T.BUTTON_C;
+
+  // Doors
+  m[4][4] = T.FIRE_DOOR;
+  m[4][36] = T.ICE_DOOR;
+
+  const movingPlatforms = [
+    { x: 7 * TILE, y: 21 * TILE, w: 3 * TILE, h: TILE * 0.5, axis: 'x', min: 6 * TILE, max: 12 * TILE, speed: 1.2, dir: 1 },
+    { x: 26 * TILE, y: 21 * TILE, w: 3 * TILE, h: TILE * 0.5, axis: 'x', min: 24 * TILE, max: 32 * TILE, speed: 1.2, dir: -1 },
+    { x: 18 * TILE, y: 12 * TILE, w: 3 * TILE, h: TILE * 0.5, axis: 'y', min: 8 * TILE, max: 16 * TILE, speed: 0.8, dir: 1 },
+    { x: 10 * TILE, y: 6 * TILE, w: 4 * TILE, h: TILE * 0.5, axis: 'x', min: 8 * TILE, max: 16 * TILE, speed: 1.5, dir: 1 },
+    { x: 24 * TILE, y: 6 * TILE, w: 4 * TILE, h: TILE * 0.5, axis: 'x', min: 22 * TILE, max: 30 * TILE, speed: 1.5, dir: -1 },
+  ];
+
+  return {
+    map: m,
+    fireStart: { x: 2 * TILE, y: 22 * TILE },
+    iceStart: { x: 37 * TILE, y: 22 * TILE },
+    movingPlatforms,
+    buttons: [
+      { type: 'A', col: 32, row: 7 },
+      { type: 'B', col: 4, row: 7 },
+      { type: 'C', col: 15, row: 13 },
+    ],
+    gates: [
+      { type: 'A', tiles: [[5,10],[4,10]] },
+      { type: 'B', tiles: [[5,29],[4,29]] },
+      { type: 'C', tiles: [[14,22],[13,22]] },
+    ],
+  };
+}
+
+const LEVELS = [buildLevel1, buildLevel2, buildLevel3];
+
+// ============================================================
+//  GAME STATE
+// ============================================================
+
+let currentLevel = 0;
+let levelData = null;
+let fire = null, ice = null;
+let movingPlatforms = [];
+let gateStates = {};  // 'A' -> open/closed
+let gameState = 'playing'; // playing, dead, complete, allcomplete
+let deathMessage = '';
+let animTimer = 0;
+let frame = 0;
+
+function createPlayer(x, y, type) {
+  return {
+    x, y, w: 24, h: 28,
+    vx: 0, vy: 0,
+    onGround: false,
+    coyoteTimer: 0,
+    jumpBufferTimer: 0,
+    hasDoubleJump: true,
+    jumpPressed: false,
+    atDoor: false,
+    type, // 'fire' or 'ice'
+    facingRight: true,
+    onPlatform: null,
+  };
+}
+
+function loadLevel(idx) {
+  if (idx >= LEVELS.length) {
+    gameState = 'allcomplete';
+    showMessage('🎉 恭喜通关！\n所有关卡完成！', '');
+    return;
+  }
+  currentLevel = idx;
+  levelData = LEVELS[idx]();
+  fire = createPlayer(levelData.fireStart.x, levelData.fireStart.y, 'fire');
+  ice = createPlayer(levelData.iceStart.x, levelData.iceStart.y, 'ice');
+  movingPlatforms = levelData.movingPlatforms.map(p => ({ ...p }));
+  gateStates = {};
+  if (levelData.gates) {
+    levelData.gates.forEach(g => gateStates[g.type] = false);
+  }
+  gameState = 'playing';
+  hideMessage();
+  topBar.textContent = `第 ${idx + 1} 关`;
+}
+
+function showMessage(text, sub) {
+  msgOverlay.style.display = 'block';
+  msgOverlay.innerHTML = text + (sub ? `<div class="sub">${sub}</div>` : '');
+}
+function hideMessage() {
+  msgOverlay.style.display = 'none';
+}
+
+// ============================================================
+//  TILE COLLISION HELPERS
+// ============================================================
+
+function tileAt(r, c) {
+  if (r < 0 || r >= ROWS || c < 0 || c >= COLS) return T.WALL;
+  return levelData.map[r][c];
+}
+
+function isSolid(t) {
+  return t === T.WALL;
+}
+
+function isGateSolid(t) {
+  if (t === T.GATE_A && !gateStates['A']) return true;
+  if (t === T.GATE_B && !gateStates['B']) return true;
+  if (t === T.GATE_C && !gateStates['C']) return true;
+  return false;
+}
+
+function isTileSolid(r, c) {
+  const t = tileAt(r, c);
+  return isSolid(t) || isGateSolid(t);
+}
+
+function isDangerous(t, playerType) {
+  if (t === T.POISON) return true;
+  if (playerType === 'fire' && t === T.WATER) return true;
+  if (playerType === 'ice' && t === T.LAVA) return true;
+  return false;
+}
+
+// ============================================================
+//  PHYSICS & COLLISION
+// ============================================================
+
+function updatePlayer(p, leftKey, rightKey, jumpKey) {
+  if (gameState !== 'playing') return;
+
+  // Horizontal input
+  let inputX = 0;
+  if (keys[leftKey]) { inputX = -1; p.facingRight = false; }
+  if (keys[rightKey]) { inputX = 1; p.facingRight = true; }
+  p.vx = inputX * MOVE_SPEED;
+
+  // Jump buffer
+  if (keys[jumpKey]) {
+    if (!p.jumpPressed) {
+      p.jumpPressed = true;
+      p.jumpBufferTimer = JUMP_BUFFER;
+    }
+  } else {
+    p.jumpPressed = false;
+    p.jumpBufferTimer = 0;
+  }
+
+  // Coyote time
+  if (p.onGround) {
+    p.coyoteTimer = COYOTE_TIME;
+  } else {
+    p.coyoteTimer--;
+  }
+
+  // Jump (first jump: coyote + buffer)
+  if (p.jumpBufferTimer > 0 && p.coyoteTimer > 0) {
+    p.vy = JUMP_VEL;
+    p.coyoteTimer = 0;
+    p.jumpBufferTimer = 0;
+    p.onGround = false;
+  }
+  // Infinite air jump
+  else if (p.jumpPressed && p.coyoteTimer <= 0 && p.jumpBufferTimer > 0) {
+    p.vy = DOUBLE_JUMP_VEL;
+    p.jumpBufferTimer = 0;
+  }
+
+  // Variable jump height
+  if (!keys[jumpKey] && p.vy < -3) {
+    p.vy *= 0.5;
+  }
+
+  p.jumpBufferTimer--;
+
+  // Gravity
+  p.vy += GRAVITY;
+  if (p.vy > MAX_FALL) p.vy = MAX_FALL;
+
+  // Track platform for movement
+  p.onPlatform = null;
+
+  // Move X
+  p.x += p.vx;
+  resolveCollisionX(p);
+
+  // Move Y
+  p.y += p.vy;
+  resolveCollisionY(p);
+
+  // Check standing on moving platform
+  checkPlatformStanding(p);
+
+  // Check hazards
+  checkHazards(p);
+
+  // Check doors
+  checkDoor(p);
+}
+
+function resolveCollisionX(p) {
+  const left = Math.floor(p.x / TILE);
+  const right = Math.floor((p.x + p.w - 1) / TILE);
+  const top = Math.floor(p.y / TILE);
+  const bottom = Math.floor((p.y + p.h - 1) / TILE);
+
+  for (let r = top; r <= bottom; r++) {
+    for (let c = left; c <= right; c++) {
+      if (isTileSolid(r, c)) {
+        if (p.vx > 0) {
+          p.x = c * TILE - p.w;
+        } else if (p.vx < 0) {
+          p.x = (c + 1) * TILE;
+        }
+        p.vx = 0;
+      }
+    }
+  }
+}
+
+function resolveCollisionY(p) {
+  const left = Math.floor(p.x / TILE);
+  const right = Math.floor((p.x + p.w - 1) / TILE);
+  const top = Math.floor(p.y / TILE);
+  const bottom = Math.floor((p.y + p.h - 1) / TILE);
+
+  p.onGround = false;
+  for (let r = top; r <= bottom; r++) {
+    for (let c = left; c <= right; c++) {
+      if (isTileSolid(r, c)) {
+        if (p.vy > 0) {
+          p.y = r * TILE - p.h;
+          p.vy = 0;
+          p.onGround = true;
+        } else if (p.vy < 0) {
+          p.y = (r + 1) * TILE;
+          p.vy = 0;
+        }
+      }
+    }
+  }
+}
+
+function checkPlatformStanding(p) {
+  for (const plat of movingPlatforms) {
+    const px = p.x, py = p.y, pw = p.w, ph = p.h;
+    // Check if player is on top of platform
+    if (px + pw > plat.x && px < plat.x + plat.w) {
+      const playerBottom = py + ph;
+      if (playerBottom >= plat.y && playerBottom <= plat.y + plat.h + 4 && p.vy >= 0) {
+        p.y = plat.y - p.h;
+        p.vy = 0;
+        p.onGround = true;
+        p.onPlatform = plat;
+      }
+    }
+    // Side / bottom collision with platform
+    if (rectsOverlap(px, py, pw, ph, plat.x, plat.y, plat.w, plat.h)) {
+      // Push out
+      const overlapLeft = (px + pw) - plat.x;
+      const overlapRight = (plat.x + plat.w) - px;
+      const overlapTop = (py + ph) - plat.y;
+      const overlapBottom = (plat.y + plat.h) - py;
+      const minOverlap = Math.min(overlapLeft, overlapRight, overlapTop, overlapBottom);
+      if (minOverlap === overlapTop && p.vy >= 0) {
+        p.y = plat.y - p.h;
+        p.vy = 0;
+        p.onGround = true;
+        p.onPlatform = plat;
+      } else if (minOverlap === overlapBottom && p.vy < 0) {
+        p.y = plat.y + plat.h;
+        p.vy = 0;
+      } else if (minOverlap === overlapLeft) {
+        p.x = plat.x - p.w;
+      } else if (minOverlap === overlapRight) {
+        p.x = plat.x + plat.w;
+      }
+    }
+  }
+}
+
+function rectsOverlap(x1,y1,w1,h1,x2,y2,w2,h2) {
+  return x1 < x2+w2 && x1+w1 > x2 && y1 < y2+h2 && y1+h1 > y2;
+}
+
+function checkHazards(p) {
+  // Check tiles the player overlaps with
+  const left = Math.floor((p.x + 4) / TILE);
+  const right = Math.floor((p.x + p.w - 5) / TILE);
+  const top = Math.floor((p.y + 4) / TILE);
+  const bottom = Math.floor((p.y + p.h - 1) / TILE);
+
+  for (let r = top; r <= bottom; r++) {
+    for (let c = left; c <= right; c++) {
+      const t = tileAt(r, c);
+      if (isDangerous(t, p.type)) {
+        die(p);
+        return;
+      }
+    }
+  }
+}
+
+function checkDoor(p) {
+  const cx = Math.floor((p.x + p.w / 2) / TILE);
+  const cy = Math.floor((p.y + p.h / 2) / TILE);
+  const t = tileAt(cy, cx);
+  if (p.type === 'fire' && t === T.FIRE_DOOR) {
+    p.atDoor = true;
+  } else if (p.type === 'ice' && t === T.ICE_DOOR) {
+    p.atDoor = true;
+  } else {
+    p.atDoor = false;
+  }
+}
+
+function die(p) {
+  gameState = 'dead';
+  const who = p.type === 'fire' ? '🔥 火人' : '🧊 冰人';
+  deathMessage = `${who} 死亡！`;
+  showMessage(deathMessage, '按 R 重试');
+}
+
+// ============================================================
+//  BUTTONS & GATES
+// ============================================================
+
+function updateButtonsAndGates() {
+  if (!levelData.buttons || !levelData.gates) return;
+
+  // Reset all gates
+  levelData.gates.forEach(g => gateStates[g.type] = false);
+
+  // Check each button
+  levelData.buttons.forEach(btn => {
+    const bx = btn.col * TILE;
+    const by = btn.row * TILE;
+    const bw = TILE;
+    const bh = TILE;
+
+    // Check if any player is standing on the button
+    [fire, ice].forEach(p => {
+      if (rectsOverlap(p.x, p.y, p.w, p.h, bx, by - 4, bw, bh + 4)) {
+        gateStates[btn.type] = true;
+      }
+    });
+  });
+
+  // Update gate tiles in map
+  levelData.gates.forEach(g => {
+    g.tiles.forEach(([r, c]) => {
+      // Gates are always in the map, we just track their state
+    });
+  });
+}
+
+// ============================================================
+//  MOVING PLATFORMS
+// ============================================================
+
+function updateMovingPlatforms() {
+  for (const plat of movingPlatforms) {
+    const prevX = plat.x;
+    const prevY = plat.y;
+
+    if (plat.axis === 'x') {
+      plat.x += plat.speed * plat.dir;
+      if (plat.x <= plat.min || plat.x + plat.w >= plat.max + plat.w) {
+        plat.dir *= -1;
+      }
+    } else {
+      plat.y += plat.speed * plat.dir;
+      if (plat.y <= plat.min || plat.y >= plat.max) {
+        plat.dir *= -1;
+      }
+    }
+
+    const dx = plat.x - prevX;
+    const dy = plat.y - prevY;
+
+    // Move players standing on this platform
+    [fire, ice].forEach(p => {
+      if (p.onPlatform === plat) {
+        p.x += dx;
+        p.y += dy;
+      }
+    });
+  }
+}
+
+// ============================================================
+//  RENDERING
+// ============================================================
+
+function drawTile(c, r, t) {
+  const x = c * TILE;
+  const y = r * TILE;
+
+  switch(t) {
+    case T.WALL:
+      // Stone wall with subtle gradient
+      const grd = ctx.createLinearGradient(x, y, x + TILE, y + TILE);
+      grd.addColorStop(0, '#3a3a4a');
+      grd.addColorStop(1, '#2a2a3a');
+      ctx.fillStyle = grd;
+      ctx.fillRect(x, y, TILE, TILE);
+      // Brick lines
+      ctx.strokeStyle = '#222233';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x + 0.5, y + 0.5, TILE - 1, TILE - 1);
+      // Inner detail
+      ctx.strokeStyle = '#444455';
+      ctx.beginPath();
+      ctx.moveTo(x + TILE / 2, y);
+      ctx.lineTo(x + TILE / 2, y + TILE / 2);
+      ctx.moveTo(x, y + TILE / 2);
+      ctx.lineTo(x + TILE, y + TILE / 2);
+      ctx.stroke();
+      break;
+
+    case T.LAVA:
+      drawLava(x, y);
+      break;
+
+    case T.WATER:
+      drawWater(x, y);
+      break;
+
+    case T.POISON:
+      drawPoison(x, y);
+      break;
+
+    case T.FIRE_DOOR:
+      drawDoor(x, y, 'fire');
+      break;
+
+    case T.ICE_DOOR:
+      drawDoor(x, y, 'ice');
+      break;
+
+    case T.BUTTON_A:
+    case T.BUTTON_B:
+    case T.BUTTON_C:
+      drawButton(x, y, t);
+      break;
+
+    case T.GATE_A:
+    case T.GATE_B:
+    case T.GATE_C:
+      drawGate(x, y, t);
+      break;
+  }
+}
+
+function drawLava(x, y) {
+  const t = frame * 0.05;
+  ctx.fillStyle = '#cc2200';
+  ctx.fillRect(x, y, TILE, TILE);
+  // Animated glow
+  const glow = Math.sin(t + x * 0.1) * 0.3 + 0.7;
+  ctx.fillStyle = `rgba(255, 100, 0, ${glow * 0.6})`;
+  ctx.fillRect(x, y, TILE, TILE);
+  // Surface ripple
+  ctx.fillStyle = `rgba(255, 200, 0, ${glow * 0.5})`;
+  const waveY = Math.sin(t * 2 + x * 0.15) * 3;
+  ctx.fillRect(x, y + waveY, TILE, 4);
+  // Bright spots
+  ctx.fillStyle = `rgba(255, 255, 100, ${Math.sin(t * 3 + x * 0.2) * 0.3 + 0.3})`;
+  ctx.beginPath();
+  ctx.arc(x + TILE/2 + Math.sin(t + x) * 5, y + TILE/2, 3, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawWater(x, y) {
+  const t = frame * 0.04;
+  ctx.fillStyle = '#0044aa';
+  ctx.fillRect(x, y, TILE, TILE);
+  // Animated wave
+  const wave = Math.sin(t + x * 0.12) * 0.3 + 0.6;
+  ctx.fillStyle = `rgba(0, 150, 255, ${wave * 0.5})`;
+  ctx.fillRect(x, y, TILE, TILE);
+  // Surface
+  ctx.fillStyle = `rgba(100, 200, 255, ${wave * 0.6})`;
+  const waveY = Math.sin(t * 1.5 + x * 0.1) * 3;
+  ctx.fillRect(x, y + waveY, TILE, 3);
+  // Bubble
+  ctx.fillStyle = `rgba(200, 230, 255, ${Math.sin(t * 2 + x * 0.3) * 0.3 + 0.2})`;
+  ctx.beginPath();
+  ctx.arc(x + 10 + Math.sin(t * 0.7 + x) * 4, y + 10 + Math.sin(t * 1.3) * 4, 2, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawPoison(x, y) {
+  const t = frame * 0.04;
+  ctx.fillStyle = '#114400';
+  ctx.fillRect(x, y, TILE, TILE);
+  const glow = Math.sin(t + x * 0.1) * 0.3 + 0.6;
+  ctx.fillStyle = `rgba(0, 255, 0, ${glow * 0.3})`;
+  ctx.fillRect(x, y, TILE, TILE);
+  // Bubbles
+  ctx.fillStyle = `rgba(100, 255, 50, ${glow * 0.5})`;
+  const bubY = Math.sin(t * 2 + x * 0.2) * 4;
+  ctx.beginPath();
+  ctx.arc(x + TILE/2, y + TILE/3 + bubY, 3, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = `rgba(150, 255, 0, ${glow * 0.4})`;
+  const waveY = Math.sin(t * 1.8 + x * 0.15) * 2;
+  ctx.fillRect(x, y + waveY, TILE, 3);
+}
+
+function drawDoor(x, y, type) {
+  const isFireDoor = type === 'fire';
+  const baseColor = isFireDoor ? '#aa2200' : '#0044cc';
+  const glowColor = isFireDoor ? 'rgba(255, 100, 0, 0.6)' : 'rgba(0, 150, 255, 0.6)';
+  const t = frame * 0.05;
+  const glow = Math.sin(t) * 0.3 + 0.7;
+
+  // Door frame
+  ctx.fillStyle = '#555';
+  ctx.fillRect(x + 2, y - TILE + 2, TILE - 4, TILE * 2 - 4);
+  // Door body
+  ctx.fillStyle = baseColor;
+  ctx.fillRect(x + 4, y - TILE + 4, TILE - 8, TILE * 2 - 8);
+  // Glow
+  ctx.fillStyle = glowColor.replace('0.6', String(glow * 0.4));
+  ctx.fillRect(x + 4, y - TILE + 4, TILE - 8, TILE * 2 - 8);
+  // Symbol
+  ctx.font = '18px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(isFireDoor ? '🔥' : '🧊', x + TILE/2, y + 4);
+}
+
+function drawButton(x, y, type) {
+  const btnType = type === T.BUTTON_A ? 'A' : type === T.BUTTON_B ? 'B' : 'C';
+  const pressed = gateStates[btnType];
+  const color = pressed ? '#888' : '#cc8800';
+
+  // Base
+  ctx.fillStyle = '#444';
+  ctx.fillRect(x + 4, y + TILE - 8, TILE - 8, 8);
+  // Button top
+  ctx.fillStyle = color;
+  const bh = pressed ? 4 : 10;
+  ctx.fillRect(x + 6, y + TILE - 8 - bh + 8, TILE - 12, bh);
+  // Glow when not pressed
+  if (!pressed) {
+    ctx.fillStyle = 'rgba(255, 200, 0, 0.3)';
+    ctx.fillRect(x + 6, y + TILE - bh, TILE - 12, bh);
+  }
+}
+
+function drawGate(x, y, type) {
+  const gateType = type === T.GATE_A ? 'A' : type === T.GATE_B ? 'B' : 'C';
+  const open = gateStates[gateType];
+  if (open) {
+    // Draw faded gate
+    ctx.fillStyle = 'rgba(100, 100, 100, 0.2)';
+    ctx.fillRect(x + 2, y + 2, TILE - 4, TILE - 4);
+    // Dashed outline
+    ctx.setLineDash([4, 4]);
+    ctx.strokeStyle = 'rgba(150, 150, 150, 0.3)';
+    ctx.strokeRect(x + 2, y + 2, TILE - 4, TILE - 4);
+    ctx.setLineDash([]);
+  } else {
+    // Solid gate
+    ctx.fillStyle = '#886600';
+    ctx.fillRect(x + 1, y + 1, TILE - 2, TILE - 2);
+    // Cross hatch pattern
+    ctx.strokeStyle = '#664400';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(x + 4, y + 4); ctx.lineTo(x + TILE - 4, y + TILE - 4);
+    ctx.moveTo(x + TILE - 4, y + 4); ctx.lineTo(x + 4, y + TILE - 4);
+    ctx.stroke();
+    ctx.lineWidth = 1;
+    // Edge highlight
+    ctx.strokeStyle = '#aa8800';
+    ctx.strokeRect(x + 1, y + 1, TILE - 2, TILE - 2);
+  }
+}
+
+function drawMovingPlatform(plat) {
+  const t = frame * 0.03;
+  ctx.fillStyle = '#667788';
+  ctx.fillRect(plat.x, plat.y, plat.w, plat.h);
+  // Top highlight
+  ctx.fillStyle = '#8899aa';
+  ctx.fillRect(plat.x, plat.y, plat.w, 3);
+  // Edge marks
+  ctx.fillStyle = '#556677';
+  for (let i = 0; i < plat.w; i += 16) {
+    ctx.fillRect(plat.x + i + 2, plat.y + 2, 4, plat.h - 4);
+  }
+  // Subtle glow
+  ctx.fillStyle = `rgba(100, 180, 255, ${Math.sin(t + plat.x * 0.01) * 0.1 + 0.1})`;
+  ctx.fillRect(plat.x, plat.y, plat.w, plat.h);
+}
+
+function drawPlayer(p) {
+  const x = p.x;
+  const y = p.y;
+  const w = p.w;
+  const h = p.h;
+  const t = frame * 0.1;
+
+  if (p.type === 'fire') {
+    // Body
+    ctx.fillStyle = '#dd3300';
+    ctx.fillRect(x + 2, y + 6, w - 4, h - 6);
+    // Head
+    ctx.fillStyle = '#ee4400';
+    ctx.fillRect(x + 4, y + 2, w - 8, 12);
+    // Eyes
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(x + 7, y + 5, 4, 4);
+    ctx.fillRect(x + 14, y + 5, 4, 4);
+    ctx.fillStyle = '#000';
+    const ex = p.facingRight ? 2 : 0;
+    ctx.fillRect(x + 8 + ex, y + 6, 2, 2);
+    ctx.fillRect(x + 15 + ex, y + 6, 2, 2);
+    // Flame effect on head
+    for (let i = 0; i < 5; i++) {
+      const fx = x + 4 + i * 4;
+      const fy = y - 2 - Math.sin(t + i * 1.5) * 4;
+      const fh = 4 + Math.sin(t * 1.3 + i) * 3;
+      ctx.fillStyle = `rgba(255, ${150 + i * 20}, 0, ${0.8 - i * 0.1})`;
+      ctx.beginPath();
+      ctx.moveTo(fx, y + 4);
+      ctx.lineTo(fx + 2, fy);
+      ctx.lineTo(fx + 4, y + 4);
+      ctx.fill();
+    }
+    // Glow
+    ctx.fillStyle = `rgba(255, 100, 0, ${Math.sin(t) * 0.15 + 0.1})`;
+    ctx.fillRect(x - 2, y - 2, w + 4, h + 4);
+
+    // Door indicator
+    if (p.atDoor) {
+      ctx.fillStyle = `rgba(255, 200, 0, ${Math.sin(t * 3) * 0.3 + 0.5})`;
+      ctx.fillRect(x - 4, y - 8, w + 8, 4);
+    }
+  } else {
+    // Ice player
+    // Body
+    ctx.fillStyle = '#2266cc';
+    ctx.fillRect(x + 2, y + 6, w - 4, h - 6);
+    // Head
+    ctx.fillStyle = '#3388ee';
+    ctx.fillRect(x + 4, y + 2, w - 8, 12);
+    // Eyes
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(x + 7, y + 5, 4, 4);
+    ctx.fillRect(x + 14, y + 5, 4, 4);
+    ctx.fillStyle = '#000';
+    const ex = p.facingRight ? 2 : 0;
+    ctx.fillRect(x + 8 + ex, y + 6, 2, 2);
+    ctx.fillRect(x + 15 + ex, y + 6, 2, 2);
+    // Ice crystals on head
+    ctx.strokeStyle = `rgba(150, 220, 255, ${0.7 + Math.sin(t * 0.8) * 0.3})`;
+    ctx.lineWidth = 2;
+    for (let i = 0; i < 4; i++) {
+      const cx = x + 5 + i * 5;
+      const cy = y - 1 - Math.sin(t * 0.5 + i) * 2;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy - 5);
+      ctx.lineTo(cx, cy + 2);
+      ctx.moveTo(cx - 3, cy - 2);
+      ctx.lineTo(cx + 3, cy - 2);
+      ctx.stroke();
+    }
+    ctx.lineWidth = 1;
+    // Glow
+    ctx.fillStyle = `rgba(50, 150, 255, ${Math.sin(t * 0.7) * 0.1 + 0.08})`;
+    ctx.fillRect(x - 2, y - 2, w + 4, h + 4);
+
+    // Door indicator
+    if (p.atDoor) {
+      ctx.fillStyle = `rgba(100, 200, 255, ${Math.sin(t * 3) * 0.3 + 0.5})`;
+      ctx.fillRect(x - 4, y - 8, w + 8, 4);
+    }
+  }
+}
+
+function drawBackground() {
+  // Dark temple/cave gradient
+  const grd = ctx.createLinearGradient(0, 0, 0, H);
+  grd.addColorStop(0, '#0d0d15');
+  grd.addColorStop(0.5, '#121220');
+  grd.addColorStop(1, '#0a0a18');
+  ctx.fillStyle = grd;
+  ctx.fillRect(0, 0, W, H);
+
+  // Ambient particles
+  const t = frame * 0.01;
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.02)';
+  for (let i = 0; i < 30; i++) {
+    const px = (Math.sin(t + i * 3.7) * 0.5 + 0.5) * W;
+    const py = (Math.cos(t * 0.7 + i * 2.3) * 0.5 + 0.5) * H;
+    ctx.beginPath();
+    ctx.arc(px, py, 1 + Math.sin(t + i) * 0.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function render() {
+  drawBackground();
+
+  // Draw tiles
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const t = levelData.map[r][c];
+      if (t !== T.AIR) {
+        drawTile(c, r, t);
+      }
+    }
+  }
+
+  // Draw moving platforms
+  for (const plat of movingPlatforms) {
+    drawMovingPlatform(plat);
+  }
+
+  // Draw players
+  drawPlayer(fire);
+  drawPlayer(ice);
+}
+
+// ============================================================
+//  GAME LOOP
+// ============================================================
+
+function update() {
+  frame++;
+
+  if (gameState === 'playing') {
+    // Update moving platforms first
+    updateMovingPlatforms();
+
+    // Update buttons and gates
+    updateButtonsAndGates();
+
+    // Update players
+    updatePlayer(fire, 'ArrowLeft', 'ArrowRight', 'ArrowUp');
+    updatePlayer(ice, 'KeyA', 'KeyD', 'KeyW');
+
+    // Check win condition
+    if (fire.atDoor && ice.atDoor) {
+      gameState = 'complete';
+      animTimer = 120;
+      showMessage('🎉 过关！', '即将进入下一关...');
+    }
+  }
+
+  if (gameState === 'complete') {
+    animTimer--;
+    if (animTimer <= 0) {
+      loadLevel(currentLevel + 1);
+    }
+  }
+
+  // Restart
+  if (keys['KeyR']) {
+    keys['KeyR'] = false;
+    loadLevel(currentLevel);
+  }
+
+  // Render
+  render();
+
+  requestAnimationFrame(update);
+}
+
+// --- Start ---
+loadLevel(0);
+update();
+
+</script>
+</body>
+</html>
